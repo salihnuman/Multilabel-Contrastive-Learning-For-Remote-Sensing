@@ -6,7 +6,7 @@ from os.path import isfile, join
 from torch.utils.data import Dataset, DataLoader, Subset
 from PIL import Image
 import pandas as pd
-from pycocotools.coco import COCO
+#from pycocotools.coco import COCO
 from torchvision import datasets, transforms
 
 class UCMDataset(Dataset):
@@ -129,6 +129,113 @@ class UCMDatasetMultiLabel(Dataset):
             image = self.transform(image)
 
         return image, self.targets[idx]
+
+
+class AIDDatasetMultiLabel(Dataset):
+    def __init__(self, images_root, labels_path, transform=None, split='both'):
+        """
+        Args:
+            images_root: Path to the images directory (should contain images_tr and images_test folders)
+            labels_path: Path to the multilabel.csv file
+            transform: Transform to apply to images
+            split: 'train', 'test', or 'both' to specify which split to use
+        """
+        self.rootPath = images_root
+        self.transform = transform
+        self.labels_path = labels_path
+        self.split = split
+
+        self.classes = ['airplane','bare-soil','buildings','cars','chaparral','court',
+                        'dock','field','grass','mobile-home','pavement','sand','sea',
+                        'ship','tanks','trees','water']
+
+        # AID uses CSV format (comma-separated), not tab-separated like UCM
+        self.gt_dataFrame = pd.read_csv(self.labels_path, delimiter=',')
+
+        # load up all the filenames into a list
+        self.sampleFilenames = []
+        self.targets = []
+        
+        print("Creating AID dataset")
+        
+        # Determine which folders to process based on split
+        folders_to_process = []
+        if self.split == 'train' or self.split == 'both':
+            train_path = os.path.join(self.rootPath, 'images_tr')
+            if os.path.exists(train_path):
+                folders_to_process.append(('images_tr', train_path))
+        
+        if self.split == 'test' or self.split == 'both':
+            test_path = os.path.join(self.rootPath, 'images_test')
+            if os.path.exists(test_path):
+                folders_to_process.append(('images_test', test_path))
+        
+        for split_name, split_path in folders_to_process:
+            # get the list of directories in the split path
+            listOfDirs = next(os.walk(split_path))[1]
+            listOfDirs.sort()
+            
+            for dir in listOfDirs:
+                files = os.listdir(os.path.join(split_path, dir))
+                files.sort()    # make sure the files are in the same order as in the GT file
+                
+                for file in files:
+                    filePath = os.path.join(split_path, dir, file)
+                    self.sampleFilenames.append(filePath)
+                    
+                    # strip the extension so as to match it 
+                    # to the filename column of the dataframe
+                    # AID naming convention: airport_1.jpg -> airport_1
+                    file_key = os.path.splitext(file)[0]
+                    df = self.gt_dataFrame.loc[self.gt_dataFrame['IMAGE\LABEL']==file_key]
+                    
+                    if len(df) > 0:
+                        labels = df[self.classes].values
+                        labels = labels[0,...]  # it's 2-dim (1,17) convert to (17), a 1D array
+                        labels = labels.astype(float)    # otherwise they remain integers
+                        self.targets.append(labels)
+                    else:
+                        print(f"Warning: No labels found for {file_key}")
+                        # Create zero labels if no match found
+                        labels = np.zeros(len(self.classes), dtype=float)
+                        self.targets.append(labels)
+
+        print(f"Found {len(self.sampleFilenames)} samples")
+        print(f"Found {len(self.targets)} labels")
+        self.label_freq = self.get_label_frequencies()
+        print("AID dataset created")
+
+    def __len__(self):
+        """
+        return the total number of samples in this dataset
+        """
+        return len(self.sampleFilenames)
+
+    def get_label_frequencies(self):
+        """
+        Return the frequency of each label in the dataset.
+        """
+        label_counts = np.zeros(len(self.classes))
+        
+        for labels in self.targets:
+            label_counts += labels
+        
+        total_samples = len(self.targets)
+        label_frequencies = label_counts / total_samples
+        
+        return label_frequencies.tolist(), label_counts.tolist()
+    
+    def __getitem__(self, idx):
+        """
+        return the next sample
+        """
+        image = Image.open(self.sampleFilenames[idx])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, self.targets[idx]
+
 """
 class COCODataset(datasets.coco.CocoDetection):
     def __init__(self, root, annFile, transform=None, target_transform=None):

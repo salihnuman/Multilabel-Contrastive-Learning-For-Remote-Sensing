@@ -11,7 +11,7 @@ from sklearn.model_selection import train_test_split
 from utils import setSeed, printDiagnostics, verifySplitStratification
 import matplotlib.pyplot as plt
 from torchvision import models
-from datasets import UCMDatasetMultiLabel
+from datasets import AIDDatasetMultiLabel
 from torch.backends import cudnn
 from models import SupCEResNet, SupConResNet, LinearClassifier
 from losses import MulSupCosineLossCustom, SupConLoss, MulSupConLossCustom, MulSupCosineLossCustomOneCrop, MulSupCosineLoss, WeightedMulSupConLossCustom, WeightedMulSupCosineLossCustom
@@ -22,8 +22,8 @@ from torcheval.metrics.functional import multilabel_accuracy
 from sklearn.metrics import average_precision_score, precision_score, recall_score, f1_score
 
 """
-We'll handle the UCM dataset with 2100 images.
-100 samples per class. Each of them being 256x256 pixels and RGB color.
+We'll handle the AID dataset with 3000 images.
+100 samples per class for training, 20 per class for test. Each of them being 600x600 pixels and RGB color.
 Supervised contrastive loss for pretraining, followed by cross-entropy
 Resnet-18 architecture
 Multi-label supervised contrastive loss.
@@ -197,7 +197,7 @@ def test(model, classifier, device, test_loader, test_loader_default = None):
         #plt.title(f"Predicted: {pred_targets}")
         #plt.text(110, 240, f"True: {str(true_targets)}", ha="center", fontsize=12)
         print(f"Image {index}: Predicted: {pred_targets}, True: {true_targets}")
-        plt.savefig(f"MultilabelContrastive/images/any_test_image_{index}.png")
+        plt.savefig(f"MultilabelContrastive/images/aid_test_image_{index}.png")
         plt.clf()
         if index == 9:
             break
@@ -272,7 +272,7 @@ def main():
             #transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
             #transforms.RandomGrayscale(p=0.2),
             transforms.ToTensor(),
-            transforms.Normalize([0.4842,0.4901,0.4505], [0.1734,0.1635,0.1554])
+            transforms.Normalize([0.4024, 0.4090, 0.3708], [0.1564, 0.1431, 0.1378])  # AID-specific (all 3000 images, 600x600)
         ]
     )
 
@@ -280,63 +280,92 @@ def main():
         [
             transforms.RandomResizedCrop(size=32, scale=(0.2, 1.0)),
             transforms.ToTensor(),
-            transforms.Normalize([0.4842,0.4901,0.4505], [0.1734,0.1635,0.1554])
+            transforms.Normalize([0.4024, 0.4090, 0.3708], [0.1564, 0.1431, 0.1378])  # AID-specific (all 3000 images, 600x600)
         ]
     )
 
     datasetWithTrainTransforms = None
     
     if PRETRAIN_MODE:
-        datasetWithTrainTransforms = UCMDatasetMultiLabel("data/UCM/Images/", 
-                                   "data/UCM/multilabels/LandUse_Multilabeled.txt", 
-                                   train_transform)
+        datasetWithTrainTransforms = AIDDatasetMultiLabel("data/AID/images/", 
+                                   "data/AID/multilabel .csv", 
+                                   train_transform,
+                                   split='train')
                                    #TwoCropTransform(train_transform))
     else:
-        datasetWithTrainTransforms = UCMDatasetMultiLabel("data/UCM/Images/", 
-                                   "data/UCM/multilabels/LandUse_Multilabeled.txt", 
-                                   train_transform)
+        datasetWithTrainTransforms = AIDDatasetMultiLabel("data/AID/images/", 
+                                   "data/AID/multilabel .csv", 
+                                   train_transform,
+                                   split='train')
         
-    datasetWithTestTransforms = UCMDatasetMultiLabel("data/UCM/Images/", 
-                                   "data/UCM/multilabels/LandUse_Multilabeled.txt",
-                                   test_transform)
+    datasetWithTestTransforms = AIDDatasetMultiLabel("data/AID/images/", 
+                                   "data/AID/multilabel .csv",
+                                   test_transform,
+                                   split='both')  # Use both for getting label frequencies and creating val/test splits
     default_transform = transforms.Compose([
         transforms.Resize((224,224)),
         transforms.ToTensor()
     ])
 
-    #datasetWithDefaultTransforms = UCMDatasetMultiLabel("data/UCM/Images/", 
-    #                               "data/UCM/multilabels/LandUse_Multilabeled.txt", 
-    #                               default_transform)
-    # Stratified Sampling for train and val
-    # Train, Val, Test: 70/10/20 w.r.t. the single-label distribution
-    # 1470, 210 and 420 samples respectively
+    #datasetWithDefaultTransforms = AIDDatasetMultiLabel("data/AID/images/", 
+    #                               "data/AID/multilabel .csv", 
+    #                               default_transform,
+    #                               split='both')
+    # For AID dataset: Train split has 2400 images (80 per class * 30 classes)
+    # Test split has 600 images (20 per class * 30 classes)  
+    # We'll use ALL train split data and divide it with same ratio as UCM for train/val
+    # Final test uses the original test split
 
     ### Weighted Sampling
-    label_freq = np.array(datasetWithTestTransforms.label_freq)             # TRAIN
+    label_freq = np.array(datasetWithTestTransforms.label_freq[0])  # Get frequencies, not counts
     #print("Label freq: ", label_freq)
-    label_weights = 1.0 / label_freq
+    label_weights = 1.0 / (label_freq + 1e-8)  # Add small epsilon to avoid division by zero
     # Normalize label weights
     #label_weights = label_weights / label_weights.sum()
     ### Weighted Sampling
     
     #print("Label weights: ", label_weights)
+    
+    # Create datasets for train/val from training split and test from test split
+    train_dataset_full = AIDDatasetMultiLabel("data/AID/images/", 
+                                             "data/AID/multilabel .csv", 
+                                             train_transform,
+                                             split='train')  # 2400 samples
+    
+    val_test_dataset = AIDDatasetMultiLabel("data/AID/images/", 
+                                           "data/AID/multilabel .csv", 
+                                           test_transform,
+                                           split='test')   # 600 samples for final testing
+    
+    # For AID: Use same train/val ratio as UCM within available training data
+    # UCM: 70/(70+10) = 87.5% train, 10/(70+10) = 12.5% val from train+val data  
+    # AID: Apply same ratio to 80 available training samples per class
+    # 87.5% of 80 = 70 samples for train, 12.5% of 80 = 10 samples for val
+    # This uses ALL available training data while maintaining UCM's methodology
+    train_per_class = 70  # 87.5% of 80 training samples
+    val_per_class = 10    # 12.5% of 80 training samples
+    
     train_indices = []
     val_indices = []
-    test_indices = []
+    test_indices = list(range(len(val_test_dataset)))  # All test data (600 samples)
+    
+    # AID dataset processes directories alphabetically, 80 samples per class
+    for class_idx in range(30):  # 30 classes in AID
+        class_start = class_idx * 80  # 80 samples per class in train split
+        
+        # Train: first 70 samples of each class
+        for j in range(train_per_class):
+            train_indices.append(class_start + j)
+        
+        # Val: remaining 10 samples of each class
+        for j in range(val_per_class):
+            val_indices.append(class_start + train_per_class + j)
+        
+        # Now we use ALL 80 training samples: 70*30=2100 train, 10*30=300 val, 20*30=600 test
 
-    for i in range(21):
-        for j in range(70):
-            train_indices.append(i*100+j)
-
-        for j in range(10):
-            val_indices.append(i*100+70+j)
-
-        for j in range(20):
-            test_indices.append(i*100+80+j)
-
-    train_dataset = Subset(datasetWithTrainTransforms, train_indices)
-    val_dataset = Subset(datasetWithTestTransforms, val_indices)
-    test_dataset = Subset(datasetWithTestTransforms, test_indices)
+    train_dataset = Subset(train_dataset_full, train_indices)
+    val_dataset = Subset(train_dataset_full, val_indices)  # Use same dataset as train for val  
+    test_dataset = Subset(val_test_dataset, test_indices)
     #test_dataset_default = Subset(datasetWithDefaultTransforms, test_indices)
 
     #verifySplitStratification(train_dataset, val_dataset, test_dataset)
@@ -363,11 +392,11 @@ def main():
         # logger - start a new wandb run to track this script
         wandb.login()
         wandb.init(
-            project="UCM_multi_label_contrastive",
+            project="AID_multi_label_contrastive",
             config={
             "learning_rate": LR,
             "architecture": "Resnet18",
-            "dataset": "UCM_multi",
+            "dataset": "AID_multi",
             "epochs": EPOCHS,
             }
         )
@@ -405,17 +434,17 @@ def main():
             trainContrastive(model, train_loader, optimizer, epoch, criterion, wandb)
             #scheduler.step()
         # save the last model
-        torch.save(model.state_dict(), f"MultilabelContrastive/save/UCM/ucm_resnet18_multilabel_WCosine_one_onecrop_{BATCH_SIZE}batch_{EPOCHS}epoch_2.pt")
-        print(f"Model saved to MultilabelContrastive/save/UCM/ucm_resnet18_multilabel_WCosine_one_onecrop_{BATCH_SIZE}batch_{EPOCHS}epoch_2.pt")
+        torch.save(model.state_dict(), f"MultilabelContrastive/save/AID/aid_resnet18_multilabel_WCosine_one_onecrop_{BATCH_SIZE}batch_{EPOCHS}epoch.pt")
+        print(f"Model saved to MultilabelContrastive/save/AID/aid_resnet18_multilabel_WCosine_one_onecrop_{BATCH_SIZE}batch_{EPOCHS}epoch.pt")
     elif TRAIN_MODE:
         # logger - start a new wandb run to track this script
         wandb.login()
         wandb.init(
-            project="UCM_multi_label_contrastive_classifier",
+            project="AID_multi_label_contrastive_classifier",
             config={
             "learning_rate": LR,
             "architecture": "Resnet18",
-            "dataset": "UCM_single",
+            "dataset": "AID_multi",
             "epochs": EPOCHS,
             }
         )
@@ -425,7 +454,7 @@ def main():
         criterion = nn.BCEWithLogitsLoss()
         classifier = LinearClassifier(name='resnet18', num_classes=NUM_CLASSES)
         
-        state_dict = torch.load('MultilabelContrastive/save/UCM/ucm_resnet18_multilabel_WCosine_one_onecrop_128batch_200epoch_2.pt', map_location="cpu")
+        state_dict = torch.load('MultilabelContrastive/save/AID/aid_resnet18_multilabel_WCosine_one_onecrop_128batch_200epoch.pt', map_location="cpu")
 
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -459,15 +488,15 @@ def main():
             train(model, classifier, device, train_loader, optimizer, epoch, criterion, wandb, finetune=False)
             validate(val_loader, model, classifier, criterion, wandb)
             #scheduler.step()
-        torch.save(classifier.state_dict(), f"MultilabelContrastive/save/UCM/ucm_linear_dummy_classifier.pt")
-        #torch.save(classifier.state_dict(), f"MultilabelContrastive/save/UCM/ucm_linear_WCosine_one_onecrop_200_128batch_16batchtrain_{EPOCHS}epoch_classifier_2.pt")
-        #print(f"Model saved to MultilabelContrastive/save/UCM/ucm_linear_Jaccard_one_onecrop_200_128batch_16batchtrain_{EPOCHS}epoch_classifier_2.pt")
+        torch.save(classifier.state_dict(), f"MultilabelContrastive/save/AID/aid_linear_classifier.pt")
+        #torch.save(classifier.state_dict(), f"MultilabelContrastive/save/AID/aid_linear_WCosine_one_onecrop_200_128batch_16batchtrain_{EPOCHS}epoch_classifier.pt")
+        #print(f"Model saved to MultilabelContrastive/save/AID/aid_linear_WCosine_one_onecrop_200_128batch_16batchtrain_{EPOCHS}epoch_classifier.pt")
     else:
         model = SupConResNet(name='resnet18')
         classifier = LinearClassifier(name='resnet18', num_classes=NUM_CLASSES)
-        state_dict = torch.load('MultilabelContrastive/save/UCM/ucm_resnet18_multilabel_WCosine_one_onecrop_128batch_200epoch_2.pt', map_location="cpu")
-        #classifier.load_state_dict(torch.load('MultilabelContrastive/save/UCM/ucm_linear_WCosine_one_onecrop_200_128batch_16batchtrain_100epoch_classifier.pt', weights_only=True))
-        classifier.load_state_dict(torch.load('MultilabelContrastive/save/UCM/ucm_linear_dummy_classifier.pt', weights_only=True))
+        state_dict = torch.load('MultilabelContrastive/save/AID/aid_resnet18_multilabel_WCosine_one_onecrop_128batch_200epoch.pt', map_location="cpu")
+        #classifier.load_state_dict(torch.load('MultilabelContrastive/save/AID/aid_linear_WCosine_one_onecrop_200_128batch_16batchtrain_100epoch_classifier.pt', weights_only=True))
+        classifier.load_state_dict(torch.load('MultilabelContrastive/save/AID/aid_linear_classifier.pt', weights_only=True))
 
         new_state_dict = {}
         for k, v in state_dict.items():
